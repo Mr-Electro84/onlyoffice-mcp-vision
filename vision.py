@@ -51,6 +51,60 @@ def unwrap(data):
     return data
 
 
+class _DownloadDenied(Exception):
+    """HTTP 401/403 from a download URL. Never include query parameters here."""
+
+    def __init__(self, status_code: int, host: str):
+        self.status_code = status_code
+        self.host = host
+        super().__init__(f"HTTP {status_code} sur l'hôte {host}")
+
+
+async def _download_signed_image(
+    client: httpx.AsyncClient, url: str, bearer_token: str | None = None
+) -> bytes:
+    """Stream a signed URL with bounded redirects and strict host-only auth.
+
+    The Bearer credential must NEVER be forwarded to a redirected host.
+    """
+    portal_host = urlparse(docspace_origin()).hostname
+    for _ in range(4):
+        ensure_safe_download(url)
+        host = (urlparse(url).hostname or "").lower()
+        headers = {"Accept": "image/*, application/octet-stream"}
+        if bearer_token is not None and host == portal_host:
+            headers["Authorization"] = f"Bearer {bearer_token}"
+        async with client.stream("GET", url, headers=headers) as stream:
+            if stream.status_code in (301, 302, 303, 307, 308):
+                location = stream.headers.get("location")
+                if not location:
+                    raise ValueError("Redirection de téléchargement sans destination")
+                from urllib.parse import urljoin
+                url = urljoin(url, location)
+                continue
+            if stream.status_code in (401, 403):
+                raise _DownloadDenied(stream.status_code, host)
+            if stream.status_code >= 400:
+                raise RuntimeError(f"Téléchargement DocSpace HTTP {stream.status_code} sur {host}")
+            data = bytearray()
+            async for chunk in stream.aiter_bytes():
+                data.extend(chunk)
+                if len(data) > MAX_IMAGE_BYTES:
+                    raise ValueError("Image téléchargée trop volumineuse (10 Mio maximum)")
+            return bytes(data)
+    raise ValueError("Trop de redirections de téléchargement")
+
+
+async def _get_presigned_url(client: httpx.AsyncClient, origin: str, file_id: int, headers: dict) -> str:
+    res = await client.get(f"{origin}/api/2.0/files/file/{file_id}/presigneduri", headers=headers)
+    res.raise_for_status()
+    signed = unwrap(res.json())
+    if not isinstance(signed, str):
+        raise ValueError("Réponse presigneduri invalide: URL attendue")
+    ensure_safe_download(signed)
+    return signed
+
+
 async def read_docspace_image(file_id: int) -> tuple[bytes, str]:
     if not isinstance(file_id, int) or isinstance(file_id, bool) or file_id <= 0:
         raise ValueError("file_id doit être un identifiant numérique DocSpace positif")
@@ -73,31 +127,34 @@ async def read_docspace_image(file_id: int) -> tuple[bytes, str]:
             if "volumineuse" in str(exc):
                 raise
 
-        url_res = await client.get(f"{origin}/api/2.0/files/file/{file_id}/presigneduri", headers=headers)
-        url_res.raise_for_status()
-        signed = unwrap(url_res.json())
-        if not isinstance(signed, str):
-            raise ValueError("Réponse presigneduri invalide: URL attendue")
-        url = signed
-        for _ in range(4):
-            ensure_safe_download(url)
-            async with client.stream("GET", url, headers={"Accept": "image/*, application/octet-stream"}) as stream:
-                if stream.status_code in (301, 302, 303, 307, 308):
-                    location = stream.headers.get("location")
-                    if not location:
-                        raise ValueError("Redirection sans URL")
-                    from urllib.parse import urljoin
-                    url = urljoin(url, location)
-                    continue
-                stream.raise_for_status()
-                data = bytearray()
-                async for chunk in stream.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > MAX_IMAGE_BYTES:
-                        raise ValueError("Image téléchargée trop volumineuse (10 Mio maximum)")
-                break
-        else:
-            raise ValueError("Trop de redirections de téléchargement")
+        signed_url = await _get_presigned_url(client, origin, file_id, headers)
+        try:
+            # First try the documented time-limited download link as-is.
+            data = await _download_signed_image(client, signed_url)
+        except _DownloadDenied as first:
+            # ONLYOFFICE filehandler.ashx may additionally demand auth.
+            # Never send our API key to other download hosts or redirects.
+            if first.host != urlparse(origin).hostname:
+                raise RuntimeError(
+                    f"Lien de téléchargement refusé par {first.host} (HTTP {first.status_code}). "
+                    "Aucun identifiant n'a été transmis à cet hôte. "
+                    "Vérifiez la configuration de téléchargement DocSpace."
+                ) from None
+            # Mint a fresh URL so the second attempt does not reuse a stale token.
+            signed_url = await _get_presigned_url(client, origin, file_id, headers)
+            try:
+                data = await _download_signed_image(
+                    client, signed_url, bearer_token=required("DOCSPACE_API_KEY")
+                )
+            except _DownloadDenied as second:
+                raise RuntimeError(
+                    f"Téléchargement DocSpace refusé : HTTP {first.status_code} sans "
+                    f"authentification puis HTTP {second.status_code} avec Bearer "
+                    f"(hôte final : {second.host}). "
+                    "L'API de métadonnées fonctionne, mais le gestionnaire de fichiers "
+                    "n'autorise pas le téléchargement. Vérifier la session, les "
+                    "permissions ou contacter ONLYOFFICE SaaS."
+                ) from None
 
     try:
         with Image.open(BytesIO(data)) as im:
